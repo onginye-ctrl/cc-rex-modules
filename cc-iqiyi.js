@@ -4,7 +4,7 @@
 var WidgetMetadata = {
   id: "cc.playback.iqiyi",
   title: "爱奇艺",
-  version: "1.0.1",
+  version: "1.0.2",
   requiredVersion: "0.0.6",
   description: "爱奇艺 CMS 独立播放资源",
   author: "cc",
@@ -14,6 +14,7 @@ var WidgetMetadata = {
       title: "爱奇艺",
       functionName: "loadResource",
       type: "stream",
+      iconurl: "https://www.iqiyi.com/favicon.ico",
       params: [],
     },
   ],
