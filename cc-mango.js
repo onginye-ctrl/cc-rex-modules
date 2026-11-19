@@ -4,7 +4,7 @@
 var WidgetMetadata = {
   id: "cc.playback.mango",
   title: "芒果TV",
-  version: "1.0.1",
+  version: "1.0.2",
   requiredVersion: "0.0.6",
   description: "芒果TV CMS 独立播放资源，支持备用接口自动切换",
   author: "cc",
@@ -14,6 +14,7 @@ var WidgetMetadata = {
       title: "芒果TV",
       functionName: "loadResource",
       type: "stream",
+      iconurl: "https://static.hitv.com/pc/icons/icon_64x64.1b7ca7.png",
       params: [],
     },
   ],
