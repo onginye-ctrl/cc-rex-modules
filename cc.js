@@ -62,7 +62,7 @@ function catalogParams() {
 var WidgetMetadata = {
   id: "cc.catalog",
   title: "cc",
-  version: "3.0.1",
+  version: "3.0.2",
   requiredVersion: "0.0.6",
   description: "影视目录、平台分类、搜索与详情",
   author: "LibreTV Rex Contributors",
@@ -249,18 +249,25 @@ function responseData(response) {
   return value;
 }
 
+async function requestCmsAt(endpoint, query) {
+  var response = await Widget.http.request({
+    url: appendQuery(endpoint, query),
+    method: "GET",
+    headers: { Accept: "application/json" },
+    timeout: REQUEST_TIMEOUT_SECONDS,
+  });
+  return responseData(response);
+}
+
 async function requestCms(source, query) {
   var endpoints = [source.url].concat(source.mirrors || []);
   var lastError;
   for (var i = 0; i < endpoints.length; i++) {
     try {
-      var response = await Widget.http.request({
-        url: appendQuery(endpoints[i], query),
-        method: "GET",
-        headers: { Accept: "application/json" },
-        timeout: REQUEST_TIMEOUT_SECONDS,
-      });
-      return responseData(response);
+      return {
+        data: await requestCmsAt(endpoints[i], query),
+        endpoint: endpoints[i],
+      };
     } catch (error) {
       lastError = error;
       if (i < endpoints.length - 1) {
@@ -288,13 +295,14 @@ function isAdult(item) {
   return ADULT_WORDS.some(function (word) { return text.indexOf(word) >= 0; });
 }
 
-function itemToSearchResult(item, source) {
+function itemToSearchResult(item, source, endpoint) {
   return {
     sourceKey: source.key,
     sourceName: source.name,
     vodId: asText(item.vod_id),
+    endpoint: endpoint,
     title: asText(item.vod_name) || "未命名影片",
-    cover: resolveUrl(item.vod_pic, source.url),
+    cover: resolveUrl(item.vod_pic, endpoint),
     typeName: asText(item.type_name || item.vod_class),
     year: asText(item.vod_year),
     area: asText(item.vod_area),
@@ -332,6 +340,7 @@ function resultToVideo(item) {
   var reference = {
     sourceKey: item.sourceKey,
     vodId: String(item.vodId),
+    endpoint: item.endpoint,
     title: item.title,
     releaseYear: item.year,
   };
@@ -348,16 +357,17 @@ function resultToVideo(item) {
 }
 
 async function listSource(source, keyword, page) {
-  var data = await requestCms(source, {
+  var response = await requestCms(source, {
     ac: "videolist",
     wd: keyword || undefined,
     pg: page || 1,
   });
+  var data = response.data;
   var list = Array.isArray(data.list) ? data.list : [];
   return list.filter(function (item) {
     return item && item.vod_id !== undefined && !isAdult(item);
   }).map(function (item) {
-    return itemToSearchResult(item, source);
+    return itemToSearchResult(item, source, response.endpoint);
   });
 }
 
@@ -608,13 +618,23 @@ function parsePlayGroups(vod, source) {
   return groups;
 }
 
-async function fetchDetail(source, vodId) {
-  var data = await requestCms(source, { ac: "videolist", ids: vodId });
+async function fetchDetail(source, vodId, endpoint, expectedTitle, expectedYear) {
+  var targetEndpoint = asText(endpoint) || source.url;
+  var data = await requestCmsAt(targetEndpoint, { ac: "videolist", ids: vodId });
   if (!Array.isArray(data.list) || !data.list.length) throw new Error("片源没有返回详情");
   var vod = data.list[0] || {};
-  var groups = parsePlayGroups(vod, source);
+  if (expectedTitle && normalizedTitle(vod.vod_name) !== normalizedTitle(expectedTitle)) {
+    throw new Error("片源详情与搜索结果标题不一致");
+  }
+  var actualYear = asText(vod.vod_year).substring(0, 4);
+  var wantedYear = asText(expectedYear).substring(0, 4);
+  if (wantedYear && actualYear && wantedYear !== actualYear) {
+    throw new Error("片源详情与搜索结果年份不一致");
+  }
+  var requestSource = { name: source.name, url: targetEndpoint };
+  var groups = parsePlayGroups(vod, requestSource);
   if (!groups.length) throw new Error("未找到可播放地址");
-  return { vod: vod, groups: groups };
+  return { vod: vod, groups: groups, endpoint: targetEndpoint };
 }
 
 function cleanDescription(value) {
@@ -630,6 +650,45 @@ function normalizedTitle(value) {
   return asText(value).toLowerCase().replace(/[\s.,，。!！?？:：·\-_'"]/g, "");
 }
 
+function normalizedEpisodeTitle(value) {
+  return asText(value).toLowerCase().replace(/[\s.,，。!！?？:：·\-_'"]/g, "");
+}
+
+function episodeNumber(value) {
+  var label = asText(value);
+  var match = label.match(/第\s*0*(\d+)\s*[集期话]/i) ||
+    label.match(/(?:^|[^a-z])ep?\s*0*(\d+)(?:[^0-9]|$)/i) ||
+    label.match(/^0*(\d+)$/);
+  return match ? Number(match[1]) : null;
+}
+
+function selectEpisode(group, episodeIndex, episodeName) {
+  var episodes = group && Array.isArray(group.episodes) ? group.episodes : [];
+  var expectedLabel = normalizedEpisodeTitle(episodeName);
+  if (expectedLabel) {
+    var exact = episodes.find(function (episode) {
+      return normalizedEpisodeTitle(episode.title) === expectedLabel;
+    });
+    if (exact) return exact;
+  }
+  var expectedNumber = episodeNumber(episodeName);
+  if (expectedNumber === null && Number.isFinite(episodeIndex)) {
+    expectedNumber = episodeIndex + 1;
+  }
+  if (expectedNumber !== null) {
+    var numbered = episodes.filter(function (episode) {
+      return episodeNumber(episode.title) !== null;
+    });
+    var numberedMatch = numbered.find(function (episode) {
+      return episodeNumber(episode.title) === expectedNumber;
+    });
+    if (numberedMatch) return numberedMatch;
+    if (numbered.length) return null;
+  }
+  if (episodes.length === 1 && episodeIndex === 0) return episodes[0];
+  return expectedLabel ? null : episodes[episodeIndex] || null;
+}
+
 async function fetchCatalogDetails(sources, title, releaseYear) {
   var items = await aggregateSources(sources, title, 1);
   if (!items.length) return [];
@@ -643,7 +702,10 @@ async function fetchCatalogDetails(sources, title, releaseYear) {
     var yearItems = exactItems.filter(function (item) {
       return asText(item.year).substring(0, 4) === expectedYear;
     });
-    if (yearItems.length) exactItems = yearItems;
+    var unknownYearItems = exactItems.filter(function (item) {
+      return !asText(item.year).substring(0, 4);
+    });
+    exactItems = yearItems.length ? yearItems : unknownYearItems;
   }
   var candidates = exactItems;
   var seenSources = {};
@@ -658,7 +720,7 @@ async function fetchCatalogDetails(sources, title, releaseYear) {
       return {
         source: source,
         reference: item,
-        detail: await fetchDetail(source, item.vodId),
+        detail: await fetchDetail(source, item.vodId, item.endpoint, item.title, item.year),
       };
     } catch (error) {
       console.warn(item.sourceName + "详情获取失败：" +
@@ -688,6 +750,7 @@ function catalogDetailResponse(reference, matches, tmdbDetail) {
         catalogPlayback: true,
         title: reference.title,
         episode: index,
+        episodeName: episodeCount === 1 ? "正片" : "第 " + String(index + 1) + " 集",
         releaseYear: reference.releaseYear,
       }),
     });
@@ -764,7 +827,13 @@ async function loadDetail(link) {
     );
   }
   var source = findSource(sources, reference.sourceKey);
-  var detail = await fetchDetail(source, reference.vodId);
+  var detail = await fetchDetail(
+    source,
+    reference.vodId,
+    reference.endpoint,
+    reference.title,
+    reference.releaseYear
+  );
   var vod = detail.vod;
   var primary = detail.groups.find(function (group) {
     return group.episodes.some(function (episode) {
@@ -782,8 +851,10 @@ async function loadDetail(link) {
       link: encodeLink({
         sourceKey: source.key,
         vodId: String(reference.vodId),
+        endpoint: detail.endpoint,
         title: title,
         episode: index,
+        episodeName: episode.title || "第 " + String(index + 1) + " 集",
         releaseYear: asText(vod.vod_year),
       }),
     };
@@ -804,6 +875,7 @@ async function loadDetail(link) {
     link: encodeLink({
       sourceKey: source.key,
       vodId: String(reference.vodId),
+      endpoint: detail.endpoint,
       title: title,
       releaseYear: asText(vod.vod_year),
     }),
@@ -817,12 +889,15 @@ async function loadResource(params) {
     var catalogEpisode = reference.episode !== undefined
       ? Number(reference.episode)
       : Math.max(0, Number((params && params.episode) || 1) - 1);
+    var catalogEpisodeName = asText(
+      reference.episodeName || (params && params.episodeName)
+    );
     var matches = await fetchCatalogDetails(sources, reference.title, reference.releaseYear);
     var catalogItems = [];
     var seenUrls = {};
     matches.forEach(function (match) {
       match.detail.groups.forEach(function (group) {
-        var selected = group.episodes[catalogEpisode];
+        var selected = selectEpisode(group, catalogEpisode, catalogEpisodeName);
         if (!selected || !/^https?:\/\//i.test(selected.url) || seenUrls[selected.url]) return;
         seenUrls[selected.url] = true;
         catalogItems.push({
@@ -838,15 +913,22 @@ async function loadResource(params) {
     return catalogItems;
   }
   var source = findSource(sources, reference.sourceKey);
-  var detail = await fetchDetail(source, reference.vodId);
+  var detail = await fetchDetail(
+    source,
+    reference.vodId,
+    reference.endpoint,
+    reference.title,
+    reference.releaseYear
+  );
   var episode = Number(
     reference.episode !== undefined
       ? reference.episode
       : Math.max(0, Number((params && params.episode) || 1) - 1)
   );
+  var episodeName = asText(reference.episodeName || (params && params.episodeName));
   var items = [];
   detail.groups.forEach(function (group) {
-    var selected = group.episodes[episode];
+    var selected = selectEpisode(group, episode, episodeName);
     if (selected && /^https?:\/\//i.test(selected.url)) {
       items.push({
         name: detail.groups.length > 1 ? source.name + " · " + group.name : source.name,

@@ -4,7 +4,7 @@
 var WidgetMetadata = {
   id: "cc.playback.iqiyi",
   title: "爱奇艺",
-  version: "1.0.2",
+  version: "1.0.3",
   requiredVersion: "0.0.6",
   description: "爱奇艺 CMS 独立播放资源",
   author: "cc",
@@ -71,11 +71,12 @@ function decodeContext(params) {
     }
   }
   return {
-    title: text(context.title || (params && params.title)),
+    title: text(context.title || (params && (params.seriesName || params.title))),
     releaseYear: text(
       context.releaseYear ||
       (params && (params.year || params.releaseDate))
     ).substring(0, 4),
+    episodeName: text(context.episodeName || (params && params.episodeName)),
     episode: context.episode !== undefined
       ? Number(context.episode)
       : Math.max(0, Number((params && params.episode) || 1) - 1),
@@ -97,9 +98,24 @@ async function findVod(title, releaseYear) {
     var sameYear = exact.filter(function (item) {
       return text(item.vod_year).substring(0, 4) === releaseYear;
     });
-    if (sameYear.length) exact = sameYear;
+    var unknownYear = exact.filter(function (item) {
+      return !text(item.vod_year).substring(0, 4);
+    });
+    exact = sameYear.length ? sameYear : unknownYear;
   }
   return exact[0] || null;
+}
+
+function normalizedEpisodeTitle(value) {
+  return text(value).toLowerCase().replace(/[\s.,，。!！?？:：·\-_'"]/g, "");
+}
+
+function episodeNumber(value) {
+  var label = text(value);
+  var match = label.match(/第\s*0*(\d+)\s*[集期话]/i) ||
+    label.match(/(?:^|[^a-z])ep?\s*0*(\d+)(?:[^0-9]|$)/i) ||
+    label.match(/^0*(\d+)$/);
+  return match ? Number(match[1]) : null;
 }
 
 function parseGroups(vod) {
@@ -109,14 +125,43 @@ function parseGroups(vod) {
       name: text(names[index]),
       episodes: group.split("#").map(function (entry) {
         var separator = entry.indexOf("$");
-        return separator >= 0 ? text(entry.substring(separator + 1)) : text(entry);
-      }).filter(function (url) {
-        return /^https?:\/\//i.test(url);
+        var title = separator >= 0 ? text(entry.substring(0, separator)) : "";
+        var url = separator >= 0 ? text(entry.substring(separator + 1)) : text(entry);
+        return { title: title, url: url };
+      }).filter(function (episode) {
+        return /^https?:\/\//i.test(episode.url);
       }),
     };
   }).filter(function (group) {
     return group.episodes.length > 0;
   });
+}
+
+function selectEpisode(group, context) {
+  var episodes = group.episodes;
+  var expectedLabel = normalizedEpisodeTitle(context.episodeName);
+  if (expectedLabel) {
+    var exact = episodes.find(function (episode) {
+      return normalizedEpisodeTitle(episode.title) === expectedLabel;
+    });
+    if (exact) return exact;
+  }
+  var expectedNumber = episodeNumber(context.episodeName);
+  if (expectedNumber === null && Number.isFinite(context.episode)) {
+    expectedNumber = context.episode + 1;
+  }
+  if (expectedNumber !== null) {
+    var numbered = episodes.filter(function (episode) {
+      return episodeNumber(episode.title) !== null;
+    });
+    var numberedMatch = numbered.find(function (episode) {
+      return episodeNumber(episode.title) === expectedNumber;
+    });
+    if (numberedMatch) return numberedMatch;
+    if (numbered.length) return null;
+  }
+  if (episodes.length === 1 && context.episode === 0) return episodes[0];
+  return expectedLabel ? null : episodes[context.episode] || null;
 }
 
 async function loadResource(params) {
@@ -127,14 +172,22 @@ async function loadResource(params) {
   var detail = await requestCms({ ac: "videolist", ids: vod.vod_id });
   var fullVod = Array.isArray(detail.list) && detail.list[0];
   if (!fullVod) throw new Error("爱奇艺详情不可用");
+  if (normalizedTitle(fullVod.vod_name) !== normalizedTitle(context.title)) {
+    throw new Error("爱奇艺详情与搜索结果标题不一致");
+  }
+  var actualYear = text(fullVod.vod_year).substring(0, 4);
+  if (context.releaseYear && actualYear && actualYear !== context.releaseYear) {
+    throw new Error("爱奇艺详情与搜索结果年份不一致");
+  }
   var groups = parseGroups(fullVod);
   var selected = groups.find(function (group) {
-    var url = group.episodes[context.episode];
-    return url && /\.m3u8(?:$|\?)/i.test(url);
+    var episode = selectEpisode(group, context);
+    return episode && /\.m3u8(?:$|\?)/i.test(episode.url);
   }) || groups.find(function (group) {
-    return Boolean(group.episodes[context.episode]);
+    return Boolean(selectEpisode(group, context));
   });
-  var url = selected && selected.episodes[context.episode];
+  var episode = selected && selectEpisode(selected, context);
+  var url = episode && episode.url;
   if (!url) throw new Error("爱奇艺没有该分集");
   return [{
     name: "爱奇艺",

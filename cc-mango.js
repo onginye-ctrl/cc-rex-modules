@@ -4,7 +4,7 @@
 var WidgetMetadata = {
   id: "cc.playback.mango",
   title: "芒果TV",
-  version: "1.0.2",
+  version: "1.0.3",
   requiredVersion: "0.0.6",
   description: "芒果TV CMS 独立播放资源，支持备用接口自动切换",
   author: "cc",
@@ -47,25 +47,14 @@ function responseData(response) {
   return value;
 }
 
-async function requestCms(query) {
-  var lastError;
-  for (var i = 0; i < MANGO_ENDPOINTS.length; i++) {
-    try {
-      var response = await Widget.http.request({
-        url: appendQuery(MANGO_ENDPOINTS[i], query),
-        method: "GET",
-        headers: { Accept: "application/json" },
-        timeout: 10,
-      });
-      return responseData(response);
-    } catch (error) {
-      lastError = error;
-      if (i < MANGO_ENDPOINTS.length - 1) {
-        console.warn("芒果TV接口失败，尝试备用地址 " + String(i + 1));
-      }
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error("芒果TV接口不可用");
+async function requestCmsAt(endpoint, query) {
+  var response = await Widget.http.request({
+    url: appendQuery(endpoint, query),
+    method: "GET",
+    headers: { Accept: "application/json" },
+    timeout: 10,
+  });
+  return responseData(response);
 }
 
 function decodeContext(params) {
@@ -79,11 +68,12 @@ function decodeContext(params) {
     }
   }
   return {
-    title: text(context.title || (params && params.title)),
+    title: text(context.title || (params && (params.seriesName || params.title))),
     releaseYear: text(
       context.releaseYear ||
       (params && (params.year || params.releaseDate))
     ).substring(0, 4),
+    episodeName: text(context.episodeName || (params && params.episodeName)),
     episode: context.episode !== undefined
       ? Number(context.episode)
       : Math.max(0, Number((params && params.episode) || 1) - 1),
@@ -95,19 +85,51 @@ function normalizedTitle(value) {
 }
 
 async function findVod(title, releaseYear) {
-  var data = await requestCms({ ac: "videolist", wd: title, pg: 1 });
-  var list = Array.isArray(data.list) ? data.list : [];
   var expected = normalizedTitle(title);
-  var exact = list.filter(function (item) {
-    return normalizedTitle(item.vod_name) === expected;
-  });
-  if (releaseYear) {
-    var sameYear = exact.filter(function (item) {
-      return text(item.vod_year).substring(0, 4) === releaseYear;
-    });
-    if (sameYear.length) exact = sameYear;
+  for (var i = 0; i < MANGO_ENDPOINTS.length; i++) {
+    try {
+      var endpoint = MANGO_ENDPOINTS[i];
+      var data = await requestCmsAt(endpoint, { ac: "videolist", wd: title, pg: 1 });
+      var list = Array.isArray(data.list) ? data.list : [];
+      var exact = list.filter(function (item) {
+        return normalizedTitle(item.vod_name) === expected;
+      });
+      if (releaseYear) {
+        var sameYear = exact.filter(function (item) {
+          return text(item.vod_year).substring(0, 4) === releaseYear;
+        });
+        var unknownYear = exact.filter(function (item) {
+          return !text(item.vod_year).substring(0, 4);
+        });
+        exact = sameYear.length ? sameYear : unknownYear;
+      }
+      var match = exact[0];
+      if (!match || match.vod_id === undefined) continue;
+      var detail = await requestCmsAt(endpoint, { ac: "videolist", ids: match.vod_id });
+      var fullVod = Array.isArray(detail.list) && detail.list[0];
+      if (!fullVod || normalizedTitle(fullVod.vod_name) !== expected) continue;
+      var actualYear = text(fullVod.vod_year).substring(0, 4);
+      if (releaseYear && actualYear && actualYear !== releaseYear) continue;
+      return fullVod;
+    } catch (error) {
+      if (i < MANGO_ENDPOINTS.length - 1) {
+        console.warn("芒果TV接口失败，改用下一备用地址重新搜索");
+      }
+    }
   }
-  return exact[0] || null;
+  return null;
+}
+
+function normalizedEpisodeTitle(value) {
+  return text(value).toLowerCase().replace(/[\s.,，。!！?？:：·\-_'"]/g, "");
+}
+
+function episodeNumber(value) {
+  var label = text(value);
+  var match = label.match(/第\s*0*(\d+)\s*[集期话]/i) ||
+    label.match(/(?:^|[^a-z])ep?\s*0*(\d+)(?:[^0-9]|$)/i) ||
+    label.match(/^0*(\d+)$/);
+  return match ? Number(match[1]) : null;
 }
 
 function parseGroups(vod) {
@@ -117,9 +139,11 @@ function parseGroups(vod) {
       name: text(names[index]),
       episodes: group.split("#").map(function (entry) {
         var separator = entry.indexOf("$");
-        return separator >= 0 ? text(entry.substring(separator + 1)) : text(entry);
-      }).filter(function (url) {
-        return /^https?:\/\//i.test(url);
+        var title = separator >= 0 ? text(entry.substring(0, separator)) : "";
+        var url = separator >= 0 ? text(entry.substring(separator + 1)) : text(entry);
+        return { title: title, url: url };
+      }).filter(function (episode) {
+        return /^https?:\/\//i.test(episode.url);
       }),
     };
   }).filter(function (group) {
@@ -127,22 +151,47 @@ function parseGroups(vod) {
   });
 }
 
+function selectEpisode(group, context) {
+  var episodes = group.episodes;
+  var expectedLabel = normalizedEpisodeTitle(context.episodeName);
+  if (expectedLabel) {
+    var exact = episodes.find(function (episode) {
+      return normalizedEpisodeTitle(episode.title) === expectedLabel;
+    });
+    if (exact) return exact;
+  }
+  var expectedNumber = episodeNumber(context.episodeName);
+  if (expectedNumber === null && Number.isFinite(context.episode)) {
+    expectedNumber = context.episode + 1;
+  }
+  if (expectedNumber !== null) {
+    var numbered = episodes.filter(function (episode) {
+      return episodeNumber(episode.title) !== null;
+    });
+    var numberedMatch = numbered.find(function (episode) {
+      return episodeNumber(episode.title) === expectedNumber;
+    });
+    if (numberedMatch) return numberedMatch;
+    if (numbered.length) return null;
+  }
+  if (episodes.length === 1 && context.episode === 0) return episodes[0];
+  return expectedLabel ? null : episodes[context.episode] || null;
+}
+
 async function loadResource(params) {
   var context = decodeContext(params);
   if (!context.title) throw new Error("缺少影片标题");
-  var vod = await findVod(context.title, context.releaseYear);
-  if (!vod || vod.vod_id === undefined) throw new Error("芒果TV未找到标题完全一致的影片");
-  var detail = await requestCms({ ac: "videolist", ids: vod.vod_id });
-  var fullVod = Array.isArray(detail.list) && detail.list[0];
+  var fullVod = await findVod(context.title, context.releaseYear);
   if (!fullVod) throw new Error("芒果TV详情不可用");
   var groups = parseGroups(fullVod);
   var selected = groups.find(function (group) {
-    var url = group.episodes[context.episode];
-    return url && /\.m3u8(?:$|\?)/i.test(url);
+    var episode = selectEpisode(group, context);
+    return episode && /\.m3u8(?:$|\?)/i.test(episode.url);
   }) || groups.find(function (group) {
-    return Boolean(group.episodes[context.episode]);
+    return Boolean(selectEpisode(group, context));
   });
-  var url = selected && selected.episodes[context.episode];
+  var episode = selected && selectEpisode(selected, context);
+  var url = episode && episode.url;
   if (!url) throw new Error("芒果TV没有该分集");
   return [{
     name: "芒果TV",
